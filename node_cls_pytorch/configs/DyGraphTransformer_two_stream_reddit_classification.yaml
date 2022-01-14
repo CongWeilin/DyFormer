@@ -1,0 +1,14 @@
+attn_drop: 0.1
+feat_drop: 0.5
+max_dist: 5
+max_neighbors: -1
+max_time: 11
+memory_size: 32
+min_time: 2
+neg_sample_size: 10
+neg_weight: 0.1
+neighbor_sampling_size: 0.5
+num_heads: 8
+num_hids: 128
+num_layers: 2
+window: 5

@@ -1,0 +1,9 @@
+feat_drop: 0.5
+linear_cls_input_size: 256
+max_time: 11
+min_time: 2
+neg_sample_size: 10
+neg_weight: 0.1
+num_hiddens: 256
+num_layers: 2
+use_edge_feats: false

@@ -1,0 +1,6 @@
+hidden_size: 32
+max_time: 13
+min_time: 2
+neg_weight: 0.01
+num_attention_heads: 2
+num_hidden_layers: 2

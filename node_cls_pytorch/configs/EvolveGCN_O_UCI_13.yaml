@@ -1,0 +1,7 @@
+feat_drop: 0.5
+max_time: 13
+min_time: 2
+neg_sample_size: 10
+neg_weight: 0.01
+num_hiddens: 128
+num_layers: 2

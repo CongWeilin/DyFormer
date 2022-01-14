@@ -1,0 +1,9 @@
+feat_drop: 0.5
+max_time: 11
+min_time: 2
+neg_weight: 0.1
+num_heads: 8
+num_hiddens: 128
+num_layers: 2
+spatial_drop: 0.1
+use_residual: false

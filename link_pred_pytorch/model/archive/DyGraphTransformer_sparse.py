@@ -1,0 +1,268 @@
+import numpy as np
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F 
+from torch import Tensor
+
+from torch_geometric.nn.inits import glorot
+from torch_geometric.utils import softmax
+from torch_scatter import scatter
+
+##########################################################################
+##########################################################################
+##########################################################################
+
+class DyGraphTransformer(nn.Module):
+    def __init__(
+        self, 
+        num_features,        ## original feature vector dim: D
+        num_heads,           ## number of attention heads for Transformer: H_s
+        num_hids,            ## number of hidden units for Transformer: also as output embedding for Transformer: F_s
+        num_layers,
+        attn_drop,           ## dropout % for attn layer
+        feat_drop,
+        edge_encode_num, edge_dist_encode_num, window_size, 
+        use_unsupervised_loss,
+        neighbor_sampling_size
+    ):
+        super(DyGraphTransformer, self).__init__()
+        self.num_features   = num_features
+        self.num_heads      = num_heads
+        self.num_hids       = num_hids
+        self.num_layers     = num_layers
+        
+        self.attn_drop      = attn_drop
+        self.feat_drop      = feat_drop
+        
+        self.edge_encode_num      = edge_encode_num
+        self.edge_dist_encode_num = edge_dist_encode_num
+        self.window_size          = window_size
+        
+        self.use_unsupervised_loss = use_unsupervised_loss
+        self.neighbor_sampling_size = neighbor_sampling_size
+        
+        self.edge_embedding      = nn.Embedding(self.edge_encode_num*self.window_size, self.num_hids, max_norm=True)
+        self.edge_dist_embedding = nn.Embedding(self.edge_dist_encode_num, self.num_hids, max_norm=True)
+        
+        self.transformer_layer_list   = nn.ModuleList()
+        for ell in range(self.num_layers):
+
+            block = EncoderLayer(self.num_hids, self.feat_drop, self.attn_drop, self.num_heads)
+            self.transformer_layer_list.append(block)
+            
+        self.node_feats_fc           = nn.Linear(self.num_features, self.num_hids)
+        self.edge_encode_fc          = nn.Linear(self.num_hids, self.num_heads)
+        self.edge_dist_encode_num_fc = nn.Linear(self.num_hids, self.num_heads)
+        
+        if self.use_unsupervised_loss:
+            self.decoder_heads = nn.ModuleList()
+            for t in range(self.window_size):
+                self.decoder_heads.append(nn.Linear(self.num_hids, self.num_hids))
+                
+    def forward(self, x, edge_encodes, edge_dist_encodes, 
+                target_node_size, context_nodes_size, device):
+        
+        disjoint_row, disjoint_col = torch.where(edge_dist_encodes[:, :, 0] > 2)
+        select = disjoint_row > disjoint_col
+        disjoint_row = disjoint_row[select]
+        disjoint_col = disjoint_col[select]
+        
+        k_hop_row, k_hop_col = torch.where(edge_dist_encodes[:, :, 0] <= 2)  # window attention
+        
+        x = self.node_feats_fc(x)         
+        for ell in range(self.num_layers):
+            
+            if self.sample_each_layer or ell==0:
+                
+                if self.training:
+                    disjoint_select = torch.randperm(disjoint_row.size(0))[:2*k_hop_row.size(0)].to(device) # sparse attention
+                    disjoint_row = disjoint_row[disjoint_select]
+                    disjoint_col = disjoint_col[disjoint_select]
+
+                sparse_row = torch.cat([k_hop_row, disjoint_row, disjoint_col])
+                sparse_col = torch.cat([k_hop_col, disjoint_col, disjoint_row])
+
+                k_hop_edge_encodes = edge_encodes[sparse_row, sparse_row, :]
+                k_hop_edge_dists   = edge_dist_encodes[sparse_row, sparse_row, 0]
+
+                edge_attn_bias_1 = torch.mean(self.edge_embedding(k_hop_edge_encodes), axis=-2)
+                edge_attn_bias_1 = self.edge_encode_fc(edge_attn_bias_1)
+
+                edge_attn_bias_2 = self.edge_dist_embedding(k_hop_edge_dists)
+                edge_attn_bias_2 = self.edge_dist_encode_num_fc(edge_attn_bias_2)
+
+                edge_attn_bias = edge_attn_bias_1 + edge_attn_bias_2
+                
+            x = self.transformer_layer_list[ell](x, edge_attn_bias, sparse_row, sparse_col)
+            
+        return x.squeeze(0)
+
+##########################################################################
+##########################################################################
+##########################################################################
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size, attention_dropout_rate, head_size):
+        super(MultiHeadAttention, self).__init__()
+
+        self.head_size = head_size
+
+        self.att_size = att_size = hidden_size // head_size
+        self.scale = att_size ** -0.5
+
+        self.linear_q = nn.Linear(hidden_size, head_size * att_size)
+        self.linear_k = nn.Linear(hidden_size, head_size * att_size)
+        self.linear_v = nn.Linear(hidden_size, head_size * att_size)
+        self.att_dropout = nn.Dropout(attention_dropout_rate)
+
+        self.output_layer = nn.Linear(head_size * att_size, hidden_size)
+
+    def forward(self, q, k, v, attn_bias, sparse_row, sparse_col, attn_shape):
+        
+        ##########################
+
+        d_k = self.att_size
+        d_v = self.att_size
+        
+        # head_i = Attention(Q(W^Q)_i, K(W^K)_i, V(W^V)_i)
+        q = self.linear_q(q).view(-1, self.head_size, d_k)
+        k = self.linear_k(k).view(-1, self.head_size, d_k)
+        v = self.linear_v(v).view(-1, self.head_size, d_v)
+                
+        # Scaled Dot-Product Attention.
+        # Attention(Q, K, V) = softmax((QK^T)/sqrt(d_k))V
+        x = torch.sum(q[sparse_row, :, :] * k[sparse_col, :, :], dim=-1) * self.scale  # [b, h, q_len, k_len]
+        if attn_bias is not None:
+            x = x + attn_bias
+
+        x = softmax(values=x, indices=sparse_row)
+        x = self.att_dropout(x)
+
+        # borrow implementation from DySAT, seems like it waste more memory and takes more time
+        x = x.view(-1, self.head_size)
+        edge_inds = torch.stack([sparse_row, sparse_col])
+
+        x_head_outputs = []
+        for head in range(self.head_size):
+            x_sparse = torch.sparse.FloatTensor(edge_inds, x[:, head], attn_shape)     
+            x_ = torch.sparse.mm(x_sparse, v[:, head, :]) 
+            x_head_outputs.append(x_)
+        x = torch.cat(x_head_outputs, dim=-1)
+        
+        x = self.output_layer(x)
+        
+        return x
+    
+    # used for large-scale inference
+    @torch.no_grad()
+    def forward_using_cached_memory(self, q, k, v, attn_bias, sparse_row, sparse_col, attn_shape, device):
+        ##########################
+        d_k = self.att_size
+        d_v = self.att_size
+        ##########################
+        # head_i = Attention(Q(W^Q)_i, K(W^K)_i, V(W^V)_i)
+        q = self.linear_q(q).view(-1, self.head_size, d_k)
+        k = self.linear_k(k).view(-1, self.head_size, d_k)
+        v = self.linear_v(v).view(-1, self.head_size, d_v)
+        
+        ##########################
+        
+        num_attn_compute        = sparse_row.size(0)
+        
+        attn_compute_ind        = torch.arange(num_attn_compute).to(device)
+        attn_compute_ind_splits = torch.split(attn_compute_ind, 1024)
+        
+        x = []
+        for cur_attn_compute_ind in attn_compute_ind_splits:
+            # Scaled Dot-Product Attention.
+            # Attention(Q, K, V) = softmax((QK^T)/sqrt(d_k))V
+            cur_sparse_row = sparse_row[cur_attn_compute_ind]
+            cur_sparse_col = sparse_col[cur_attn_compute_ind]
+            x.append(attn_bias[cur_attn_compute_ind, :] + torch.sum(q[cur_sparse_row, :, :] * k[cur_sparse_col, :, :], dim=-1) * self.scale)
+        x = torch.cat(x, dim=0)
+        
+        x = softmax(values=x, indices=sparse_row)
+        x = self.att_dropout(x)
+        
+        # borrow implementation from DySAT, seems like it waste more memory and takes more time
+        x = x.view(-1, self.head_size)
+        edge_inds = torch.stack([sparse_row, sparse_col])
+        
+        x_head_outputs = []
+        for head in range(self.head_size):
+            x_sparse = torch.sparse.FloatTensor(edge_inds, x[:, head], attn_shape)     
+            x_ = torch.sparse.mm(x_sparse, v[:, head, :]) 
+            x_head_outputs.append(x_)
+        x = torch.cat(x_head_outputs, dim=-1)
+        
+        x = self.output_layer(x)
+        
+        return x
+        
+        
+        
+##########################################################################
+##########################################################################
+##########################################################################
+
+def softmax(values, indices):
+
+    src_max = scatter(values, indices, reduce='max', dim=0)
+    out = (values-src_max[indices, :]).exp()
+    out_sum = scatter(out, indices, reduce='sum', dim=0) 
+
+    return out / (out_sum[indices] + 1e-16)
+
+##########################################################################
+##########################################################################
+##########################################################################
+
+class EncoderLayer(nn.Module):
+    def __init__(self, hidden_size, dropout_rate, attention_dropout_rate, head_size):
+        super(EncoderLayer, self).__init__()
+
+        self.self_attention_norm = nn.LayerNorm(hidden_size)
+        self.self_attention = MultiHeadAttention(hidden_size, attention_dropout_rate, head_size)
+        self.self_attention_dropout = nn.Dropout(dropout_rate)
+
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn = FeedForwardNetwork(hidden_size, hidden_size, dropout_rate)
+        self.ffn_dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, attn_bias, sparse_row, sparse_col):
+        num_data = x.size(0)
+        y = self.self_attention_norm(x)
+        y = self.self_attention(y, y, y, attn_bias, sparse_row, sparse_col, (num_data, num_data))
+        y = self.self_attention_dropout(y)
+        x = x + y
+
+        y = self.ffn_norm(x)
+        y = self.ffn(y)
+        y = self.ffn_dropout(y)
+        x = x + y
+        return x
+
+##########################################################################
+##########################################################################
+##########################################################################
+
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, hidden_size, ffn_size, dropout_rate):
+        super(FeedForwardNetwork, self).__init__()
+
+        self.layer1 = nn.Linear(hidden_size, ffn_size)
+        self.gelu = nn.GELU()
+        self.layer2 = nn.Linear(ffn_size, hidden_size)
+        
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.layer2(x)
+        # x = self.dropout(x)
+        return x
+    
