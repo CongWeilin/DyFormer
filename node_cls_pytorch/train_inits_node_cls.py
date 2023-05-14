@@ -69,7 +69,7 @@ class LR(torch.nn.Module):
         self.fc_1 = torch.nn.Linear(dim, 10)
         self.fc_2 = torch.nn.Linear(10, 1)
         self.act = torch.nn.ReLU()
-        self.dropout = torch.nn.Dropout(p=drop, inplace=True)
+        self.dropout = torch.nn.Dropout(p=drop)
 
     def forward(self, x):
         x = self.act(self.fc_1(x))
