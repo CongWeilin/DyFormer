@@ -97,14 +97,14 @@ def generate_compressed_graphs(graphs, alpha = 0.15, max_dist=5): # Checked
     
     #### edge_dist_encode
     st = time.time()
-    adj = nx.to_scipy_sparse_matrix(graphs[-1])
+    adj = nx.to_scipy_sparse_array(graphs[-1])
     edge_dist_encode = compute_shortest_path_dist(adj, max_dist)
     print('Compute Edge encoding takes time', time.time() - st)
 
     #### PPR
     st = time.time()
     sparse_edge_exist = csr_matrix((edge_encode_all_data, (edge_encode_all_row, edge_encode_all_col)), shape=(num_nodes, num_nodes))
-    G = nx.from_scipy_sparse_matrix(sparse_edge_exist)
+    G = nx.from_scipy_sparse_array(sparse_edge_exist)
     PPR = np.array(nx.google_matrix(G, alpha), dtype=np.float32)
     print('Compute PPR takes time', time.time() - st)    
 
